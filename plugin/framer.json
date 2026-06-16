@@ -1,0 +1,7 @@
+{
+  "id": "ai-image-upscaler",
+  "name": "AI Image Upscaler",
+  "modes": ["canvas", "editImage"],
+  "icon": "https://your-domain.com/icon.svg",
+  "description": "Upscale any image with AI - up to 6x resolution"
+}

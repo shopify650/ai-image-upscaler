@@ -1,0 +1,15 @@
+{
+  "name": "ai-image-upscaler-backend",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@vercel/node": "^3.0.0"
+  },
+  "devDependencies": {
+    "vercel": "^34.0.0"
+  }
+}
