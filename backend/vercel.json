@@ -1,10 +1,4 @@
 {
-  "env": {
-    "MODELSLAB_API_KEY": "@modelslab-api-key",
-    "IMAGEROUTER_API_KEY": "@imagerouter-api-key",
-    "OPENROUTER_API_KEY": "@openrouter-api-key",
-    "BLOB_READ_WRITE_TOKEN": "@blob-read-write-token"
-  },
   "headers": [
     {
       "source": "/api/(.*)",
