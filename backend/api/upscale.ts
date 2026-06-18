@@ -29,46 +29,39 @@ async function pollReplicate(predictionId: string, token: string, maxSeconds = 5
   throw new Error(`Replicate timeout after ${maxSeconds}s`)
 }
 
-// ─── PRIMARY FREE ENGINE: nightmareai/real-esrgan (~$0.001/img) ──────────────
-async function upscaleWithReplicate(
+// ─── PRIMARY FREE ENGINE: DeepAI Super Resolution ──────────────
+async function upscaleWithDeepAI(
   res: VercelResponse,
   imageBase64: string,
-  scale: number = 2,
-  imageType: string = "general",
-  faceEnhance: boolean = false
 ) {
-  const KEY = process.env.REPLICATE_API_TOKEN
-  if (!KEY) throw new Error("REPLICATE_API_TOKEN not configured")
+  const KEY = process.env.DEEPAI_API_KEY || "60a9cc60-5a3f-4f6b-8b52-bfced1ccf64a"
 
-  // Pass base64 directly as data URI — no blob upload needed
-  const imageDataUri = `data:image/png;base64,${imageBase64}`
+  // DeepAI expects multipart/form-data. We can convert base64 to a Blob.
+  const b64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "")
+  const buffer = Buffer.from(b64Data, "base64")
+  const blob = new Blob([buffer], { type: "image/png" })
 
-  const startRes = await fetch("https://api.replicate.com/v1/models/nightmareai/real-esrgan/predictions", {
+  const formData = new FormData()
+  formData.append("image", blob, "image.png")
+
+  const response = await fetch("https://api.deepai.org/api/torch-srgan", {
     method: "POST",
-    headers: { Authorization: `Token ${KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      input: {
-        image: imageDataUri,
-        scale: Math.min(scale, 4),
-        face_enhance: faceEnhance,
-      },
-    }),
+    headers: { "api-key": KEY },
+    body: formData as any,
   })
 
-  if (!startRes.ok) {
-    const err = await startRes.json()
-    throw new Error(`Replicate: ${JSON.stringify(err)}`)
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}))
+    throw new Error(`DeepAI Error: ${JSON.stringify(err)}`)
   }
 
-  const prediction = await startRes.json()
-  const result = await pollReplicate(prediction.id, KEY)
-  const outputUrl = Array.isArray(result.output) ? result.output[0] : result.output
-
+  const data = await response.json()
+  
   return res.status(200).json({
     success: true,
     tier: "free",
-    engine: "Real-ESRGAN (Replicate)",
-    upscaledImageUrl: outputUrl,
+    engine: "DeepAI Super Resolution",
+    upscaledImageUrl: data.output_url,
   })
 }
 
@@ -260,8 +253,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return
     }
 
-    // ── FREE route: Replicate (nightmareai/real-esrgan) ──────────────────────
-    return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
+    // ── FREE route: DeepAI ──────────────────────
+    return await upscaleWithDeepAI(res, imageBase64)
   } catch (error: any) {
     console.error("Upscale handler error:", error)
     return res.status(500).json({ error: error.message || "Internal server error" })
