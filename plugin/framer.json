@@ -1,5 +1,5 @@
 {
-  "id": "ai-image-upscaler",
+  "id": "aiupsc",
   "name": "AI Image Upscaler",
   "modes": ["canvas", "editImage"],
   "icon": "/icon.svg",
