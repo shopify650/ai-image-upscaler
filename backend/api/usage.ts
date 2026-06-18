@@ -1,102 +1,112 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node"
+import { kv } from "@vercel/kv"
 
-const dailyStore: Map<string, { count: number; date: string }> = new Map()
-const tokenStore: Map<string, number> = new Map()
-const FREE_DAILY_LIMIT = 5
-const PRO_TOKEN_LIMIT = 100
+const FREE_TRIAL_LIMIT = 5
 
+// ─── User record shape ─────────────────────────────────────────────────────────
+interface UserRecord {
+  freeUsed: number        // how many free upscales used (never decrements)
+  hasPurchased: boolean   // ever purchased? if true, no new free trial on cancel
+  activeSub: boolean      // is subscription currently active?
+  licenseKey?: string     // the license key tied to this device
+}
+
+async function getUser(deviceId: string): Promise<UserRecord> {
+  const record = await kv.get<UserRecord>(`user:${deviceId}`)
+  return record ?? { freeUsed: 0, hasPurchased: false, activeSub: false }
+}
+
+async function saveUser(deviceId: string, data: UserRecord): Promise<void> {
+  await kv.set(`user:${deviceId}`, data)
+}
+
+// ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*")
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
   res.setHeader("Access-Control-Allow-Headers", "Content-Type")
   if (req.method === "OPTIONS") return res.status(200).end()
 
-  const { user_id, tier, license_key, action } = req.body || req.query
+  try {
+    const { deviceId, action, licenseKey } = req.body || {}
 
-  if (!user_id) {
-    return res.status(400).json({ error: "user_id required" })
-  }
-
-  // Pro uses token-based tracking by license key
-  if (tier === "pro") {
-    const key = `pro_tokens:${license_key || user_id}`
-
-    if (!tokenStore.has(key)) {
-      tokenStore.set(key, PRO_TOKEN_LIMIT)
+    if (!deviceId) {
+      return res.status(400).json({ error: "deviceId is required" })
     }
 
-    if (req.method === "GET" || action === "check") {
-      const remaining = tokenStore.get(key)!
+    const user = await getUser(deviceId)
+
+    // ── ACTION: check — returns current status ─────────────────────────────────
+    if (action === "check") {
+      if (user.activeSub) {
+        return res.status(200).json({
+          canUpscale: true,
+          tier: "pro",
+          freeUsed: user.freeUsed,
+          hasPurchased: user.hasPurchased,
+        })
+      }
+
+      // Canceled subscriber or trial exhausted — no new free trial
+      if (user.hasPurchased && !user.activeSub) {
+        return res.status(200).json({
+          canUpscale: false,
+          tier: "expired",
+          reason: "subscription_cancelled",
+          freeUsed: user.freeUsed,
+          hasPurchased: true,
+        })
+      }
+
+      // Free trial check
+      const remaining = Math.max(0, FREE_TRIAL_LIMIT - user.freeUsed)
       return res.status(200).json({
-        used: PRO_TOKEN_LIMIT - remaining,
-        limit: PRO_TOKEN_LIMIT,
-        remaining,
         canUpscale: remaining > 0,
+        tier: "free",
+        freeUsed: user.freeUsed,
+        freeRemaining: remaining,
+        freeLimit: FREE_TRIAL_LIMIT,
+        hasPurchased: false,
       })
     }
 
-    if (req.method === "POST" && action === "increment") {
-      const current = tokenStore.get(key)!
-
-      if (current <= 0) {
-        return res.status(429).json({
-          error: "All tokens used. Purchase more tokens to continue.",
-          used: PRO_TOKEN_LIMIT,
-          limit: PRO_TOKEN_LIMIT,
-          remaining: 0,
-          canUpscale: false,
-        })
+    // ── ACTION: increment — called after a successful upscale ──────────────────
+    if (action === "increment") {
+      if (!user.activeSub) {
+        // Only increment free counter if they are not a paid subscriber
+        user.freeUsed = user.freeUsed + 1
       }
-
-      tokenStore.set(key, current - 1)
-      return res.status(200).json({
-        used: PRO_TOKEN_LIMIT - (current - 1),
-        limit: PRO_TOKEN_LIMIT,
-        remaining: current - 1,
-        canUpscale: current - 1 > 0,
-      })
+      await saveUser(deviceId, user)
+      return res.status(200).json({ success: true, freeUsed: user.freeUsed })
     }
+
+    // ── ACTION: activate — called when a license key is verified ───────────────
+    if (action === "activate") {
+      if (!licenseKey) return res.status(400).json({ error: "licenseKey required" })
+      user.activeSub = true
+      user.hasPurchased = true
+      user.licenseKey = licenseKey
+      await saveUser(deviceId, user)
+      // Also create a reverse lookup: licenseKey → deviceId (for webhooks)
+      await kv.set(`license:${licenseKey}`, deviceId)
+      return res.status(200).json({ success: true })
+    }
+
+    // ── ACTION: cancel — called by LemonSqueezy webhook ───────────────────────
+    if (action === "cancel") {
+      if (!licenseKey) return res.status(400).json({ error: "licenseKey required" })
+      // Look up deviceId from license key
+      const targetDeviceId = (await kv.get<string>(`license:${licenseKey}`)) || deviceId
+      const targetUser = await getUser(targetDeviceId)
+      targetUser.activeSub = false
+      // hasPurchased stays true FOREVER — prevents free trial abuse on re-subscribe attempts
+      await saveUser(targetDeviceId, targetUser)
+      return res.status(200).json({ success: true })
+    }
+
+    return res.status(400).json({ error: "Invalid action" })
+  } catch (error: any) {
+    console.error("Usage handler error:", error)
+    return res.status(500).json({ error: error.message || "Internal server error" })
   }
-
-  // Free uses daily tracking
-  if (tier === "free" || !tier) {
-    const today = new Date().toISOString().split("T")[0]
-    const key = `${user_id}:${today}`
-
-    if (req.method === "GET" || action === "check") {
-      const usage = dailyStore.get(key)
-      const count = usage?.date === today ? usage.count : 0
-      return res.status(200).json({
-        used: count,
-        limit: FREE_DAILY_LIMIT,
-        remaining: Math.max(0, FREE_DAILY_LIMIT - count),
-        canUpscale: count < FREE_DAILY_LIMIT,
-      })
-    }
-
-    if (req.method === "POST" && action === "increment") {
-      const usage = dailyStore.get(key)
-      const currentCount = usage?.date === today ? usage.count : 0
-
-      if (currentCount >= FREE_DAILY_LIMIT) {
-        return res.status(429).json({
-          error: "Daily limit reached. Upgrade to Pro for 100 tokens.",
-          used: currentCount,
-          limit: FREE_DAILY_LIMIT,
-          remaining: 0,
-          canUpscale: false,
-        })
-      }
-
-      dailyStore.set(key, { count: currentCount + 1, date: today })
-      return res.status(200).json({
-        used: currentCount + 1,
-        limit: FREE_DAILY_LIMIT,
-        remaining: Math.max(0, FREE_DAILY_LIMIT - currentCount - 1),
-        canUpscale: currentCount + 1 < FREE_DAILY_LIMIT,
-      })
-    }
-  }
-
-  return res.status(400).json({ error: "Invalid action" })
 }

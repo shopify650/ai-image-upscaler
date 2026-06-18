@@ -204,12 +204,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" })
 
   try {
-    const { imageBase64, scaleFactor = 2 } = req.body
+    const { imageBase64, scaleFactor = 2, deviceId } = req.body
 
     if (!imageBase64) return res.status(400).json({ error: "No image provided" })
+    if (!deviceId) return res.status(400).json({ error: "deviceId is required" })
 
-    // Directly use Replicate for all requests
-    return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 4))
+    // ── Check usage before running ────────────────────────────────────────────
+    const host = req.headers.host || "localhost:3000"
+    const protocol = host.includes("localhost") ? "http" : "https"
+
+    const usageCheck = await fetch(`${protocol}://${host}/api/usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId, action: "check" }),
+    })
+    const usageData = await usageCheck.json() as any
+
+    if (!usageData.canUpscale) {
+      if (usageData.reason === "subscription_cancelled") {
+        return res.status(402).json({
+          error: "Your subscription was cancelled. Please re-subscribe to continue upscaling.",
+          reason: "subscription_cancelled",
+        })
+      }
+      return res.status(402).json({
+        error: "Free trial ended. You have used all 5 free upscales. Please subscribe to continue.",
+        reason: "trial_exhausted",
+        freeUsed: usageData.freeUsed,
+      })
+    }
+
+    // ── Run the AI upscale ────────────────────────────────────────────────────
+    await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 4))
+
+    // ── Increment usage counter after success ─────────────────────────────────
+    await fetch(`${protocol}://${host}/api/usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId, action: "increment" }),
+    }).catch(() => {}) // Don't fail the response if increment fails
+
   } catch (error: any) {
     console.error("Upscale handler error:", error)
     return res.status(500).json({ error: error.message || "Internal server error" })
