@@ -1,5 +1,4 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node"
-import { put } from "@vercel/blob"
 
 export const config = { maxDuration: 60 }
 
@@ -9,33 +8,11 @@ const PRO_MODEL_MAP: Record<string, string> = {
   "riverflow": "anthropic/claude-3-5-sonnet",
 }
 
-// Replicate: Free tier uses nightmareai/real-esrgan (92.9M runs, ~$0.001/img)
-// Uses model ID strings — Replicate resolves to latest version automatically
-const REPLICATE_FREE_MODELS: Record<string, string> = {
-  general:      "nightmareai/real-esrgan",
-  photo:        "nightmareai/real-esrgan",
-  anime:        "nightmareai/real-esrgan",   // use face_enhance=false for anime
-  illustration: "nightmareai/real-esrgan",
-}
-
-// Replicate: Pro tier uses topazlabs/image-upscale (professional grade)
 const TOPAZ_MODEL_MAP: Record<string, string> = {
-  general:      "standard",
-  photo:        "high-fidelity",
-  anime:        "cgi",
-  illustration: "cgi",
-  text:         "text-refine",
-}
-
-async function uploadToBlob(imageBase64: string): Promise<string> {
-  const buffer = Buffer.from(imageBase64, "base64")
-  const blob = await put(`uploads/${Date.now()}.png`, buffer, {
-    access: "public",
-    addRandomSuffix: true,
-    contentType: "image/png",
-    token: process.env.BLOB_READ_WRITE_TOKEN,
-  })
-  return blob.url
+  general: "standard",
+  photo: "standard",
+  illustration: "art-illustration",
+  text: "low-resolution",
 }
 
 // ─── HELPER: Poll Replicate until done ───────────────────────────────────────
@@ -63,14 +40,15 @@ async function upscaleWithReplicate(
   const KEY = process.env.REPLICATE_API_TOKEN
   if (!KEY) throw new Error("REPLICATE_API_TOKEN not configured")
 
-  const imageUrl = await uploadToBlob(imageBase64)
+  // Pass base64 directly as data URI — no blob upload needed
+  const imageDataUri = `data:image/png;base64,${imageBase64}`
 
   const startRes = await fetch("https://api.replicate.com/v1/models/nightmareai/real-esrgan/predictions", {
     method: "POST",
     headers: { Authorization: `Token ${KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       input: {
-        image: imageUrl,
+        image: imageDataUri,
         scale: Math.min(scale, 4),
         face_enhance: faceEnhance,
       },
@@ -106,15 +84,15 @@ async function upscaleWithTopaz(
   const KEY = process.env.REPLICATE_API_TOKEN
   if (!KEY) throw new Error("REPLICATE_API_TOKEN not configured")
 
-  const imageUrl = await uploadToBlob(imageBase64)
   const topazModel = TOPAZ_MODEL_MAP[enhanceMode] || TOPAZ_MODEL_MAP[imageType] || "standard"
+  const imageDataUri = `data:image/png;base64,${imageBase64}`
 
   const startRes = await fetch("https://api.replicate.com/v1/models/topazlabs/image-upscale/predictions", {
     method: "POST",
     headers: { Authorization: `Token ${KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       input: {
-        image: imageUrl,
+        image: imageDataUri,
         model: topazModel,
         scale: Math.min(scale, 6),
         face_enhancement: faceEnhance,
@@ -137,82 +115,6 @@ async function upscaleWithTopaz(
     engine: `Topaz Image Upscale (${topazModel})`,
     upscaledImageUrl: outputUrl,
   })
-}
-
-// ─── FALLBACK FREE ENGINE: ModelsLab ─────────────────────────────────────────
-async function upscaleWithModelsLab(
-  res: VercelResponse,
-  imageBase64: string,
-  scale: number = 2,
-  imageType: string = "general",
-  faceEnhance: boolean = false
-) {
-  const KEY = process.env.MODELSLAB_API_KEY
-  if (!KEY) throw new Error("MODELSLAB_API_KEY not configured")
-
-  const ESRGAN_MODELS: Record<string, string> = {
-    photo: "RealESRGAN_x4plus",
-    anime: "RealESRGAN_x4plus_anime_6B",
-    general: "realesr-general-x4v3",
-  }
-
-  const imageUrl = await uploadToBlob(imageBase64)
-  const modelId = ESRGAN_MODELS[imageType] || ESRGAN_MODELS.general
-
-  const response = await fetch("https://modelslab.com/api/v6/image_editing/super_resolution", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      key: KEY,
-      init_image: imageUrl,
-      scale,
-      model_id: modelId,
-      face_enhance: faceEnhance,
-      webhook: null,
-      track_id: null,
-    }),
-  })
-
-  if (!response.ok) throw new Error(`ModelsLab: ${response.status}`)
-
-  const data = await response.json()
-
-  if (data.status === "error") throw new Error(`ModelsLab: ${data.message}`)
-
-  if (data.status === "processing" && data.fetch_result) {
-    let result = data
-    let attempts = 0
-    while (result.status === "processing" && attempts < 20) {
-      await new Promise((r) => setTimeout(r, 2500))
-      const pollRes = await fetch(data.fetch_result, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: KEY }),
-      })
-      result = await pollRes.json()
-      attempts++
-    }
-    if (result.status === "success" && result.output?.[0]) {
-      return res.status(200).json({
-        success: true,
-        tier: "free",
-        engine: "Real-ESRGAN (ModelsLab)",
-        upscaledImageUrl: result.output[0],
-      })
-    }
-    throw new Error("ModelsLab timeout")
-  }
-
-  if (data.output?.[0]) {
-    return res.status(200).json({
-      success: true,
-      tier: "free",
-      engine: "Real-ESRGAN (ModelsLab)",
-      upscaledImageUrl: data.output[0],
-    })
-  }
-
-  throw new Error("No output from ModelsLab")
 }
 
 // ─── PRO ENGINE: OpenRouter vision models ────────────────────────────────────
@@ -357,22 +259,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return
   }
 
-  // ── FREE route: Replicate first, ModelsLab fallback ──────────────────────
-  const errors: string[] = []
-
-  // Try Replicate first (primary free engine)
-  try {
-    return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
-  } catch (err: any) {
-    errors.push(`Replicate: ${err.message}`)
-  }
-
-  // Fallback to ModelsLab
-  try {
-    return await upscaleWithModelsLab(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
-  } catch (err: any) {
-    errors.push(`ModelsLab: ${err.message}`)
-  }
-
-  return res.status(500).json({ error: `All engines failed: ${errors.join("; ")}` })
+  // ── FREE route: Replicate (nightmareai/real-esrgan) ──────────────────────
+  return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
 }
