@@ -2,7 +2,7 @@ import { framer } from "@framer/plugin"
 import { useState, useEffect, useCallback } from "react"
 import "./App.css"
 
-const API_URL = "https://your-app.vercel.app/api"
+const API_URL = "https://ai-image-upscaler-woad.vercel.app/api"
 const LEMONSQUEEZY_CHECKOUT_URL = "https://your-store.lemonsqueezy.com/buy/your-product-id"
 
 framer.showUI({ width: 350, height: 640, resizable: true })
