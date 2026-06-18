@@ -202,63 +202,68 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(200).end()
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" })
 
-  const {
-    imageBase64,
-    scaleFactor = 2,
-    enhanceMode = "general",
-    modelKey = "nano-banana-2",
-    tier = "free",
-    licenseKey = null,
-    imageType = "general",
-    faceEnhance = false,
-  } = req.body
+  try {
+    const {
+      imageBase64,
+      scaleFactor = 2,
+      enhanceMode = "general",
+      modelKey = "nano-banana-2",
+      tier = "free",
+      licenseKey = null,
+      imageType = "general",
+      faceEnhance = false,
+    } = req.body
 
-  if (!imageBase64) return res.status(400).json({ error: "No image provided" })
+    if (!imageBase64) return res.status(400).json({ error: "No image provided" })
 
-  const userId = (req.headers["x-user-id"] as string) || "anonymous"
+    const userId = (req.headers["x-user-id"] as string) || "anonymous"
 
-  // ── Validate Pro license ─────────────────────────────────────────────────
-  let validatedTier = "free"
-  if (tier === "pro" && licenseKey) {
-    try {
-      const host = req.headers.host || "localhost:3000"
-      const protocol = host.includes("localhost") ? "http" : "https"
-      const licRes = await fetch(`${protocol}://${host}/api/validate-license`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ license_key: licenseKey }),
-      })
-      const licData = await licRes.json() as any
-      if (licData.valid && licData.tier === "pro") validatedTier = "pro"
-    } catch (_) {}
-  }
-
-  // ── PRO route ────────────────────────────────────────────────────────────
-  if (validatedTier === "pro") {
-    const host = req.headers.host || "localhost:3000"
-    const protocol = host.includes("localhost") ? "http" : "https"
-
-    const usageRes = await fetch(`${protocol}://${host}/api/usage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "check" }),
-    })
-    const usageData = await usageRes.json() as any
-
-    if (!usageData.canUpscale) {
-      return res.status(402).json({ error: usageData.error || "All 100 tokens used. Purchase more to continue." })
+    // ── Validate Pro license ─────────────────────────────────────────────────
+    let validatedTier = "free"
+    if (tier === "pro" && licenseKey) {
+      try {
+        const host = req.headers.host || "localhost:3000"
+        const protocol = host.includes("localhost") ? "http" : "https"
+        const licRes = await fetch(`${protocol}://${host}/api/validate-license`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ license_key: licenseKey }),
+        })
+        const licData = await licRes.json() as any
+        if (licData.valid && licData.tier === "pro") validatedTier = "pro"
+      } catch (_) {}
     }
 
-    await upscaleWithOpenRouter(res, imageBase64, Math.min(scaleFactor, 4), enhanceMode, modelKey)
+    // ── PRO route ────────────────────────────────────────────────────────────
+    if (validatedTier === "pro") {
+      const host = req.headers.host || "localhost:3000"
+      const protocol = host.includes("localhost") ? "http" : "https"
 
-    await fetch(`${protocol}://${host}/api/usage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "increment" }),
-    })
-    return
+      const usageRes = await fetch(`${protocol}://${host}/api/usage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "check" }),
+      })
+      const usageData = await usageRes.json() as any
+
+      if (!usageData.canUpscale) {
+        return res.status(402).json({ error: usageData.error || "All 100 tokens used. Purchase more to continue." })
+      }
+
+      await upscaleWithOpenRouter(res, imageBase64, Math.min(scaleFactor, 4), enhanceMode, modelKey)
+
+      await fetch(`${protocol}://${host}/api/usage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "increment" }),
+      })
+      return
+    }
+
+    // ── FREE route: Replicate (nightmareai/real-esrgan) ──────────────────────
+    return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
+  } catch (error: any) {
+    console.error("Upscale handler error:", error)
+    return res.status(500).json({ error: error.message || "Internal server error" })
   }
-
-  // ── FREE route: Replicate (nightmareai/real-esrgan) ──────────────────────
-  return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
 }
