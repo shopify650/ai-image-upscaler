@@ -7,6 +7,7 @@
     "deploy": "vercel --prod"
   },
   "dependencies": {
+    "@vercel/blob": "^2.4.0",
     "@vercel/node": "^3.0.0"
   },
   "devDependencies": {

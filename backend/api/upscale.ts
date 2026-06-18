@@ -1,121 +1,205 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node"
+import { put } from "@vercel/blob"
 
 export const config = { maxDuration: 60 }
 
-const MODELS = {
-  free: {
-    "nano-banana-free": {
-      id: "google/gemini-2.5-flash-image:free",
-      name: "Nano Banana (Free)",
-      maxScale: 2,
-      cost: 0,
-    },
-  },
-  pro: {
-    "nano-banana-2": {
-      id: "google/gemini-3.1-flash-image-preview",
-      name: "Nano Banana 2 (Fast)",
-      maxScale: 4,
-      cost: 0.03,
-    },
-    "nano-banana-pro": {
-      id: "google/gemini-3-pro-image-preview",
-      name: "Nano Banana Pro (Best)",
-      maxScale: 4,
-      cost: 0.13,
-    },
-    "riverflow": {
-      id: "sourceful/riverflow-v2.5-pro",
-      name: "Riverflow 2.5 Pro (Ultra)",
-      maxScale: 4,
-      cost: 0.04,
-    },
-  },
+const FREE_ENGINES = ["real-esrgan", "imagerouter-free"] as const
+type FreeEngine = (typeof FREE_ENGINES)[number]
+
+const PRO_MODEL_MAP: Record<string, string> = {
+  "nano-banana-2": "google/gemini-3.1-flash-image-preview",
+  "nano-banana-pro": "google/gemini-3-pro-image-preview",
+  "riverflow": "sourceful/riverflow-v2.5-pro",
 }
 
-const PROMPTS: Record<string, (scale: number) => string> = {
-  general: (scale: number) =>
-    `Upscale this image to ${scale}x resolution. Enhance details, reduce noise, sharpen the image, improve visual quality. DO NOT add, remove, or change any content. Only enhance quality. Output the enhanced image.`,
-  photo: (scale: number) =>
-    `Professionally enhance and upscale this photograph to ${scale}x resolution. Enhance skin texture, hair detail, fabric detail, and foliage. Reduce noise and JPEG artifacts. Improve color accuracy and dynamic range. DO NOT change any content. Output the enhanced image.`,
-  illustration: (scale: number) =>
-    `Upscale this illustration/graphic to ${scale}x resolution. Preserve flat colors, clean sharp edges, and line art quality. Remove aliasing and pixelation. Maintain exact composition and style. Output the enhanced image.`,
-  text: (scale: number) =>
-    `Upscale this image to ${scale}x resolution focusing on making all text crystal clear and readable. Sharpen edges, enhance contrast for legibility. Remove blur and compression artifacts around text. DO NOT change any content. Output the enhanced image.`,
+// ModelsLab model IDs by image type
+const ESRGAN_MODELS: Record<string, string> = {
+  photo: "RealESRGAN_x4plus",
+  anime: "RealESRGAN_x4plus_anime_6B",
+  general: "realesr-general-x4v3",
 }
 
-async function processUpscale(res: VercelResponse, imageBase64: string, scale: number, mode: string, model: any, tier: string) {
-  const promptFn = PROMPTS[mode]
-  const prompt = promptFn ? promptFn(scale) : PROMPTS.general(scale)
+async function uploadToBlob(imageBase64: string): Promise<string> {
+  const buffer = Buffer.from(imageBase64, "base64")
+  const blob = await put(`uploads/${Date.now()}.png`, buffer, {
+    access: "public",
+    addRandomSuffix: true,
+    contentType: "image/png",
+    token: process.env.BLOB_READ_WRITE_TOKEN,
+  })
+  return blob.url
+}
 
-  try {
-    const openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://your-plugin.com",
-        "X-Title": "AI Upscaler Plugin",
-      },
-      body: JSON.stringify({
-        model: model.id,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: `data:image/png;base64,${imageBase64}` } },
-            ],
-          },
-        ],
-        modalities: ["text", "image"],
-        max_tokens: 4096,
-      }),
-    })
+async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, scale: number = 2, imageType: string = "general", faceEnhance: boolean = false) {
+  const KEY = process.env.MODELSLAB_API_KEY
+  if (!KEY) throw new Error("MODELSLAB_API_KEY not configured")
 
-    if (!openRouterRes.ok) {
-      const err = await openRouterRes.json()
-      return res.status(500).json({ error: "AI processing failed", details: err })
+  const modelId = ESRGAN_MODELS[imageType] || ESRGAN_MODELS.general
+
+  // ModelsLab requires a public URL (not data URL), so upload to Vercel Blob first
+  const imageUrl = await uploadToBlob(imageBase64)
+
+  const response = await fetch("https://modelslab.com/api/v6/image_editing/super_resolution", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      key: KEY,
+      init_image: imageUrl,
+      scale: scale,
+      model_id: modelId,
+      face_enhance: faceEnhance,
+      webhook: null,
+      track_id: null,
+    }),
+  })
+
+  if (!response.ok) throw new Error(`ModelsLab: ${response.status}`)
+
+  const data = await response.json()
+
+  if (data.status === "processing" && data.fetch_result) {
+    let result = data
+    let attempts = 0
+    while (result.status === "processing" && attempts < 30) {
+      await new Promise((r) => setTimeout(r, 2000))
+      const pollRes = await fetch(data.fetch_result, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: KEY }),
+      })
+      result = await pollRes.json()
+      attempts++
     }
+    if (result.status === "success" && result.output?.[0]) {
+      return res.status(200).json({
+        success: true, tier: "free",
+        engine: "Real-ESRGAN (ModelsLab Free)",
+        upscaledImageUrl: result.output[0],
+      })
+    }
+    throw new Error("ModelsLab timeout")
+  }
 
-    const data = await openRouterRes.json()
+  if (data.output?.[0]) {
+    return res.status(200).json({
+      success: true, tier: "free",
+      engine: "Real-ESRGAN (ModelsLab Free)",
+      upscaledImageUrl: data.output[0],
+    })
+  }
 
-    let imageUrl: string | null = null
-    let imageBase64Result: string | null = null
+  throw new Error("No output from ModelsLab")
+}
 
-    if (data.choices?.[0]?.message?.content) {
-      const content = data.choices[0].message.content
-      if (Array.isArray(content)) {
-        for (const part of content) {
-          if (part.type === "image_url") {
-            const url = part.image_url?.url
-            if (url?.startsWith("data:")) {
-              imageBase64Result = url
-            } else {
-              imageUrl = url
-            }
-            break
-          }
+async function upscaleWithImageRouter(res: VercelResponse, imageBase64: string) {
+  const KEY = process.env.IMAGEROUTER_API_KEY
+  if (!KEY) throw new Error("IMAGEROUTER_API_KEY not configured")
+
+  const response = await fetch("https://api.imagerouter.io/v1/openai/images/edits", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "stabilityai/stable-diffusion-xl-base-1.0",
+      prompt: "Enhance and upscale this image 2x. Improve sharpness, clarity, detail. Keep all content identical.",
+      image: `data:image/png;base64,${imageBase64}`,
+      size: "1024x1024",
+      quality: "high",
+      response_format: "url",
+    }),
+  })
+
+  if (!response.ok) throw new Error(`ImageRouter: ${response.status}`)
+
+  const data = await response.json()
+
+  if (data.data?.[0]?.url) {
+    return res.status(200).json({
+      success: true, tier: "free",
+      engine: "ImageRouter Free",
+      upscaledImageUrl: data.data[0].url,
+    })
+  }
+
+  throw new Error("No output from ImageRouter")
+}
+
+async function upscaleWithOpenRouter(
+  res: VercelResponse,
+  imageBase64: string,
+  scale: number,
+  enhanceMode: string,
+  modelKey: string,
+) {
+  const KEY = process.env.OPENROUTER_API_KEY
+  if (!KEY) throw new Error("OPENROUTER_API_KEY not configured")
+
+  const model = PRO_MODEL_MAP[modelKey] || PRO_MODEL_MAP["nano-banana-2"]
+
+  const prompts: Record<string, string> = {
+    general: `Upscale this image to ${scale}x resolution. Enhance details, reduce noise, sharpen. DO NOT change content. Output the enhanced image.`,
+    photo: `Professionally enhance this photograph at ${scale}x. Enhance skin, hair, fabric texture. Reduce noise/artifacts. Improve color accuracy. DO NOT change content.`,
+    illustration: `Upscale this illustration to ${scale}x. Preserve flat colors, clean edges, line art. Remove aliasing. DO NOT change content.`,
+    text: `Upscale this image to ${scale}x focusing on text clarity. Sharpen edges, enhance contrast. Remove blur around text. DO NOT change content.`,
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://your-plugin.com",
+      "X-Title": "AI Upscaler Plugin",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompts[enhanceMode] || prompts.general },
+          { type: "image_url", image_url: { url: `data:image/png;base64,${imageBase64}` } },
+        ],
+      }],
+      modalities: ["text", "image"],
+      max_tokens: 4096,
+    }),
+  })
+
+  if (!response.ok) {
+    const err = await response.json()
+    throw new Error(`OpenRouter: ${JSON.stringify(err)}`)
+  }
+
+  const data = await response.json()
+  let imageUrl: string | null = null
+  let imageB64: string | null = null
+
+  if (data.choices?.[0]?.message?.content) {
+    const content = data.choices[0].message.content
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === "image_url") {
+          const url = part.image_url?.url
+          if (url?.startsWith("data:")) imageB64 = url
+          else imageUrl = url
+          break
         }
       }
     }
-
-    if (!imageUrl && !imageBase64Result) {
-      return res.status(500).json({ error: "No image in AI response" })
-    }
-
-    return res.status(200).json({
-      success: true,
-      tier,
-      model: model.name,
-      scale,
-      upscaledImageUrl: imageUrl,
-      upscaledBase64: imageBase64Result,
-      usage: data.usage,
-    })
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message })
   }
+
+  if (!imageUrl && !imageB64) throw new Error("No image from OpenRouter")
+
+  return res.status(200).json({
+    success: true,
+    tier: "pro",
+    engine: `OpenRouter — ${modelKey}`,
+    upscaledImageUrl: imageUrl,
+    upscaledBase64: imageB64,
+    usage: data.usage,
+  })
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -125,40 +209,77 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(200).end()
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" })
 
-  const { imageBase64, scaleFactor = 2, enhanceMode = "general", modelKey = "nano-banana-free", tier = "free", licenseKey = null } = req.body
+  const { imageBase64, scaleFactor = 2, enhanceMode = "general", modelKey = "nano-banana-2", tier = "free", freeEngine = "real-esrgan", licenseKey = null, imageType = "general", faceEnhance = false } = req.body
 
-  if (!imageBase64) {
-    return res.status(400).json({ error: "No image provided" })
-  }
+  if (!imageBase64) return res.status(400).json({ error: "No image provided" })
 
+  const userId = req.headers["x-user-id"] as string || "anonymous"
+
+  // Pro license validation
   let validatedTier = "free"
-
   if (tier === "pro" && licenseKey) {
     try {
       const host = req.headers.host || "localhost:3000"
       const protocol = host.includes("localhost") ? "http" : "https"
-      const licenseRes = await fetch(`${protocol}://${host}/api/validate-license`, {
+      const licRes = await fetch(`${protocol}://${host}/api/validate-license`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ license_key: licenseKey }),
       })
-      const licenseData = await licenseRes.json()
-      if (licenseData.valid && licenseData.tier === "pro") {
-        validatedTier = "pro"
-      }
+      const licData = await licRes.json()
+      if (licData.valid && licData.tier === "pro") validatedTier = "pro"
     } catch (_) {}
   }
 
-  if (validatedTier === "free") {
-    const freeModel = MODELS.free["nano-banana-free"]
-    const cappedScale = Math.min(scaleFactor, freeModel.maxScale)
-    return await processUpscale(res, imageBase64, cappedScale, "general", freeModel, "free")
+  // PRO route
+  if (validatedTier === "pro") {
+    const host = req.headers.host || "localhost:3000"
+    const protocol = host.includes("localhost") ? "http" : "https"
+
+    const usageRes = await fetch(`${protocol}://${host}/api/usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "check" }),
+    })
+    const usageData = await usageRes.json()
+
+    if (!usageData.canUpscale) {
+      return res.status(402).json({ error: usageData.error || "All 100 tokens used. Purchase more to continue." })
+    }
+
+    const cappedScale = Math.min(scaleFactor, 4)
+    await upscaleWithOpenRouter(res, imageBase64, cappedScale, enhanceMode, modelKey)
+
+    // Decrement token on success
+    await fetch(`${protocol}://${host}/api/usage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "increment" }),
+    })
+    return
   }
 
-  if (validatedTier === "pro") {
-    const proModels = MODELS.pro as Record<string, any>
-    const proModel = proModels[modelKey] || proModels["nano-banana-2"]
-    const cappedScale = Math.min(scaleFactor, proModel.maxScale)
-    return await processUpscale(res, imageBase64, cappedScale, enhanceMode, proModel, "pro")
+   // FREE route with fallback chain — Real-ESRGAN is primary (free 100/day)
+  const engineOrder: FreeEngine[] = ["real-esrgan", "imagerouter-free"]
+  const startIndex = engineOrder.indexOf(freeEngine as FreeEngine)
+  const orderedEngines = startIndex >= 0
+    ? [...engineOrder.slice(startIndex), ...engineOrder.slice(0, startIndex)]
+    : engineOrder
+
+  const errors: string[] = []
+
+  for (const engine of orderedEngines) {
+    try {
+      if (engine === "real-esrgan") {
+        const cappedScale = Math.min(scaleFactor, 2)
+        return await upscaleWithModelsLab(res, imageBase64, cappedScale, imageType, faceEnhance)
+      }
+      if (engine === "imagerouter-free") return await upscaleWithImageRouter(res, imageBase64)
+    } catch (err: any) {
+      errors.push(`${engine}: ${err.message}`)
+      continue
+    }
   }
+
+  return res.status(500).json({ error: `All free engines failed: ${errors.join("; ")}` })
 }

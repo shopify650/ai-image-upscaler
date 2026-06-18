@@ -1,4 +1,4 @@
-import { framer } from "framer-plugin"
+import { framer } from "@framer/plugin"
 import { useState, useEffect, useCallback } from "react"
 import "./App.css"
 
@@ -9,6 +9,7 @@ framer.showUI({ width: 350, height: 640, resizable: true })
 
 type Tier = "free" | "pro"
 type EnhanceMode = "general" | "photo" | "illustration" | "text"
+type ImageType = "general" | "photo" | "anime" | "illustration"
 
 interface ProModel {
   key: string
@@ -54,6 +55,8 @@ export function App() {
 
   const [scaleFactor, setScaleFactor] = useState(2)
   const [enhanceMode, setEnhanceMode] = useState<EnhanceMode>("general")
+  const [imageType, setImageType] = useState<ImageType>("general")
+  const [faceEnhance, setFaceEnhance] = useState(false)
   const [selectedModel, setSelectedModel] = useState("nano-banana-2")
   const [isProcessing, setIsProcessing] = useState(false)
   const [progress, setProgress] = useState(0)
@@ -107,8 +110,8 @@ export function App() {
         setTier("pro")
         setLicenseKey(key)
         setCustomerName(data.customer?.name || "Pro User")
-        setUsageLimit(999999)
-        setUsageRemaining(999999)
+        setUsageLimit(100)
+        setUsageRemaining(100)
         await framer.setPluginData("license_key", key)
         setShowLicensePanel(false)
       } else {
@@ -141,8 +144,8 @@ export function App() {
   }, [isProcessing, progress])
 
   const handleUpscale = useCallback(async () => {
-    if (tier === "free" && usageRemaining <= 0) {
-      setError("Daily limit reached! Upgrade to Pro for unlimited upscales.")
+    if (usageRemaining <= 0) {
+      setError(tier === "free" ? "Daily limit reached! Upgrade to Pro for 100 tokens." : "All 100 tokens used. Purchase more to continue.")
       return
     }
 
@@ -171,6 +174,8 @@ export function App() {
           imageBase64: base64,
           scaleFactor: tier === "free" ? 2 : scaleFactor,
           enhanceMode: tier === "free" ? "general" : enhanceMode,
+          imageType: tier === "free" ? "general" : imageType,
+          faceEnhance: faceEnhance,
           modelKey: tier === "free" ? "nano-banana-free" : selectedModel,
           tier: tier,
           licenseKey: licenseKey || null,
@@ -197,20 +202,18 @@ export function App() {
       setProgress(100)
       setPreviewUrl(imgSrc)
 
-      if (tier === "free") {
-        setUsageRemaining((prev) => Math.max(0, prev - 1))
-      }
+      setUsageRemaining((prev) => Math.max(0, prev - 1))
 
       const newW = bitmap.width * (tier === "free" ? 2 : scaleFactor)
       const newH = bitmap.height * (tier === "free" ? 2 : scaleFactor)
-      setStatus(`Done! ${newW}x${newH}px (${data.model})`)
+      setStatus(`Done! ${newW}x${newH}px (${data.engine || data.model || ""})`)
     } catch (err: any) {
       setError(err.message)
       setStatus("Error")
     } finally {
       setIsProcessing(false)
     }
-  }, [tier, scaleFactor, enhanceMode, selectedModel, licenseKey, usageRemaining])
+  }, [tier, scaleFactor, enhanceMode, imageType, faceEnhance, selectedModel, licenseKey, usageRemaining])
 
   return (
     <div className="plugin">
@@ -220,7 +223,7 @@ export function App() {
           <div>
             <h1 className="title">AI Upscaler</h1>
             <p className="subtitle">
-              {tier === "pro" ? `Pro · ${customerName}` : "Free Plan · 5 upscales/day"}
+              {tier === "pro" ? `Pro · ${usageRemaining}/100 tokens` : "Free Plan · 5 upscales/day"}
             </p>
           </div>
         </div>
@@ -351,22 +354,22 @@ export function App() {
 
       <div className="section">
         <label className="label">
-          Enhancement Type
-          {tier === "free" && <span className="pro-lock">Pro only</span>}
+          Image Type
+          {tier === "free" && <span className="pro-lock">Pro: all types</span>}
         </label>
         <div className="btn-group four">
           {[
             { id: "general", icon: "\uD83C\uDFAF", label: "General" },
             { id: "photo", icon: "\uD83D\uDCF8", label: "Photo" },
-            { id: "illustration", icon: "\uD83C\uDFA8", label: "Art" },
-            { id: "text", icon: "\uD83D\uDCDD", label: "Text" },
+            { id: "anime", icon: "\uD83C\uDFA8", label: "Anime" },
+            { id: "illustration", icon: "\uD83C\uDFAD", label: "Illust." },
           ].map((m) => {
             const locked = tier === "free" && m.id !== "general"
             return (
               <button
                 key={m.id}
-                className={`btn-opt small ${enhanceMode === m.id && !locked ? "active" : ""} ${locked ? "locked" : ""}`}
-                onClick={() => !locked && setEnhanceMode(m.id as EnhanceMode)}
+                className={`btn-opt small ${imageType === m.id && !locked ? "active" : ""} ${locked ? "locked" : ""}`}
+                onClick={() => !locked && setImageType(m.id as ImageType)}
                 disabled={isProcessing || locked}
               >
                 <span>{m.icon}</span>
@@ -377,27 +380,67 @@ export function App() {
         </div>
       </div>
 
-      {tier === "free" && (
-        <div className="usage-bar">
-          <div className="usage-header">
-            <span>Daily Usage</span>
-            <span>{usageLimit - usageRemaining}/{usageLimit} used</span>
+      {tier === "pro" && (
+        <div className="section">
+          <label className="label">
+            Enhancement Mode
+          </label>
+          <div className="btn-group four">
+            {[
+              { id: "general", icon: "\uD83C\uDFAF", label: "General" },
+              { id: "photo", icon: "\uD83D\uDCF8", label: "Photo" },
+              { id: "illustration", icon: "\uD83C\uDFA8", label: "Art" },
+              { id: "text", icon: "\uD83D\uDCDD", label: "Text" },
+            ].map((m) => (
+              <button
+                key={m.id}
+                className={`btn-opt small ${enhanceMode === m.id ? "active" : ""}`}
+                onClick={() => setEnhanceMode(m.id as EnhanceMode)}
+                disabled={isProcessing}
+              >
+                <span>{m.icon}</span>
+                <span className="btn-label">{m.label}</span>
+              </button>
+            ))}
           </div>
-          <div className="usage-track">
-            <div
-              className="usage-fill"
-              style={{ width: `${((usageLimit - usageRemaining) / usageLimit) * 100}%` }}
-            />
-          </div>
-          {usageRemaining <= 1 && (
-            <p className="usage-warning">
-              {usageRemaining === 0 ? "No upscales remaining!" : "1 upscale left!"}
-              {" "}
-              <a href={LEMONSQUEEZY_CHECKOUT_URL} target="_blank" rel="noopener">Upgrade &rarr;</a>
-            </p>
-          )}
         </div>
       )}
+
+      <div className="section">
+        <label className="label">
+          <span>Face Enhancement</span>
+        </label>
+        <button
+          className={`btn-opt ${faceEnhance ? "active" : ""}`}
+          onClick={() => setFaceEnhance(!faceEnhance)}
+          disabled={isProcessing}
+          style={{ maxWidth: 120 }}
+        >
+          {faceEnhance ? "ON" : "OFF"}
+        </button>
+      </div>
+
+      <div className="usage-bar">
+        <div className="usage-header">
+          <span>{tier === "pro" ? "Tokens Remaining" : "Daily Usage"}</span>
+          <span>{usageRemaining}/{usageLimit} used</span>
+        </div>
+        <div className="usage-track">
+          <div
+            className="usage-fill"
+            style={{ width: `${((usageLimit - usageRemaining) / usageLimit) * 100}%` }}
+          />
+        </div>
+        {usageRemaining <= 1 && (
+          <p className="usage-warning">
+            {usageRemaining === 0
+              ? tier === "pro" ? "All tokens used! Purchase more." : "No upscales remaining!"
+              : "1 left!"}
+            {" "}
+            <a href={LEMONSQUEEZY_CHECKOUT_URL} target="_blank" rel="noopener">{tier === "pro" ? "Buy more &rarr;" : "Upgrade &rarr;"}</a>
+          </p>
+        )}
+      </div>
 
       {isProcessing && (
         <div className="progress">
@@ -415,14 +458,14 @@ export function App() {
       <button
         className={`btn-upscale ${isProcessing ? "loading" : ""} ${tier}`}
         onClick={handleUpscale}
-        disabled={isProcessing || (tier === "free" && usageRemaining <= 0)}
+        disabled={isProcessing || usageRemaining <= 0}
       >
         {isProcessing ? (
           <><span className="spinner" /> Enhancing...</>
-        ) : tier === "free" && usageRemaining <= 0 ? (
-          <>Upgrade to Pro</>
+        ) : usageRemaining <= 0 ? (
+          <>{tier === "pro" ? "Buy More Tokens" : "Upgrade to Pro"}</>
         ) : (
-          <>Upscale {tier === "free" ? "2" : scaleFactor}x{tier === "pro" && " Pro"}</>
+          <>Upscale {tier === "free" ? "2" : scaleFactor}x{tier === "pro" && ` (${usageRemaining} tokens)`}</>
         )}
       </button>
 
