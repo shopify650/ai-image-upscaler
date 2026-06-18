@@ -3,20 +3,28 @@ import { put } from "@vercel/blob"
 
 export const config = { maxDuration: 60 }
 
-const FREE_ENGINES = ["real-esrgan", "imagerouter-free"] as const
-type FreeEngine = (typeof FREE_ENGINES)[number]
-
 const PRO_MODEL_MAP: Record<string, string> = {
-  "nano-banana-2": "google/gemini-3.1-flash-image-preview",
-  "nano-banana-pro": "google/gemini-3-pro-image-preview",
-  "riverflow": "sourceful/riverflow-v2.5-pro",
+  "nano-banana-2": "google/gemini-flash-1.5",
+  "nano-banana-pro": "google/gemini-pro-1.5",
+  "riverflow": "anthropic/claude-3-5-sonnet",
 }
 
-// ModelsLab model IDs by image type
-const ESRGAN_MODELS: Record<string, string> = {
-  photo: "RealESRGAN_x4plus",
-  anime: "RealESRGAN_x4plus_anime_6B",
-  general: "realesr-general-x4v3",
+// Replicate: Free tier uses nightmareai/real-esrgan (92.9M runs, ~$0.001/img)
+// Uses model ID strings — Replicate resolves to latest version automatically
+const REPLICATE_FREE_MODELS: Record<string, string> = {
+  general:      "nightmareai/real-esrgan",
+  photo:        "nightmareai/real-esrgan",
+  anime:        "nightmareai/real-esrgan",   // use face_enhance=false for anime
+  illustration: "nightmareai/real-esrgan",
+}
+
+// Replicate: Pro tier uses topazlabs/image-upscale (professional grade)
+const TOPAZ_MODEL_MAP: Record<string, string> = {
+  general:      "standard",
+  photo:        "high-fidelity",
+  anime:        "cgi",
+  illustration: "cgi",
+  text:         "text-refine",
 }
 
 async function uploadToBlob(imageBase64: string): Promise<string> {
@@ -30,14 +38,126 @@ async function uploadToBlob(imageBase64: string): Promise<string> {
   return blob.url
 }
 
-async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, scale: number = 2, imageType: string = "general", faceEnhance: boolean = false) {
+// ─── HELPER: Poll Replicate until done ───────────────────────────────────────
+async function pollReplicate(predictionId: string, token: string, maxSeconds = 55): Promise<any> {
+  const pollUrl = `https://api.replicate.com/v1/predictions/${predictionId}`
+  const maxAttempts = Math.floor(maxSeconds / 2)
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((r) => setTimeout(r, 2000))
+    const res = await fetch(pollUrl, { headers: { Authorization: `Token ${token}` } })
+    const result = await res.json()
+    if (result.status === "succeeded") return result
+    if (result.status === "failed") throw new Error(result.error || "Replicate prediction failed")
+  }
+  throw new Error(`Replicate timeout after ${maxSeconds}s`)
+}
+
+// ─── PRIMARY FREE ENGINE: nightmareai/real-esrgan (~$0.001/img) ──────────────
+async function upscaleWithReplicate(
+  res: VercelResponse,
+  imageBase64: string,
+  scale: number = 2,
+  imageType: string = "general",
+  faceEnhance: boolean = false
+) {
+  const KEY = process.env.REPLICATE_API_TOKEN
+  if (!KEY) throw new Error("REPLICATE_API_TOKEN not configured")
+
+  const imageUrl = await uploadToBlob(imageBase64)
+
+  const startRes = await fetch("https://api.replicate.com/v1/models/nightmareai/real-esrgan/predictions", {
+    method: "POST",
+    headers: { Authorization: `Token ${KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      input: {
+        image: imageUrl,
+        scale: Math.min(scale, 4),
+        face_enhance: faceEnhance,
+      },
+    }),
+  })
+
+  if (!startRes.ok) {
+    const err = await startRes.json()
+    throw new Error(`Replicate: ${JSON.stringify(err)}`)
+  }
+
+  const prediction = await startRes.json()
+  const result = await pollReplicate(prediction.id, KEY)
+  const outputUrl = Array.isArray(result.output) ? result.output[0] : result.output
+
+  return res.status(200).json({
+    success: true,
+    tier: "free",
+    engine: "Real-ESRGAN (Replicate)",
+    upscaledImageUrl: outputUrl,
+  })
+}
+
+// ─── PRO REPLICATE ENGINE: topazlabs/image-upscale (professional grade) ──────
+async function upscaleWithTopaz(
+  res: VercelResponse,
+  imageBase64: string,
+  scale: number = 2,
+  imageType: string = "general",
+  enhanceMode: string = "general",
+  faceEnhance: boolean = false
+) {
+  const KEY = process.env.REPLICATE_API_TOKEN
+  if (!KEY) throw new Error("REPLICATE_API_TOKEN not configured")
+
+  const imageUrl = await uploadToBlob(imageBase64)
+  const topazModel = TOPAZ_MODEL_MAP[enhanceMode] || TOPAZ_MODEL_MAP[imageType] || "standard"
+
+  const startRes = await fetch("https://api.replicate.com/v1/models/topazlabs/image-upscale/predictions", {
+    method: "POST",
+    headers: { Authorization: `Token ${KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      input: {
+        image: imageUrl,
+        model: topazModel,
+        scale: Math.min(scale, 6),
+        face_enhancement: faceEnhance,
+      },
+    }),
+  })
+
+  if (!startRes.ok) {
+    const err = await startRes.json()
+    throw new Error(`Topaz: ${JSON.stringify(err)}`)
+  }
+
+  const prediction = await startRes.json()
+  const result = await pollReplicate(prediction.id, KEY)
+  const outputUrl = Array.isArray(result.output) ? result.output[0] : result.output
+
+  return res.status(200).json({
+    success: true,
+    tier: "pro",
+    engine: `Topaz Image Upscale (${topazModel})`,
+    upscaledImageUrl: outputUrl,
+  })
+}
+
+// ─── FALLBACK FREE ENGINE: ModelsLab ─────────────────────────────────────────
+async function upscaleWithModelsLab(
+  res: VercelResponse,
+  imageBase64: string,
+  scale: number = 2,
+  imageType: string = "general",
+  faceEnhance: boolean = false
+) {
   const KEY = process.env.MODELSLAB_API_KEY
   if (!KEY) throw new Error("MODELSLAB_API_KEY not configured")
 
-  const modelId = ESRGAN_MODELS[imageType] || ESRGAN_MODELS.general
+  const ESRGAN_MODELS: Record<string, string> = {
+    photo: "RealESRGAN_x4plus",
+    anime: "RealESRGAN_x4plus_anime_6B",
+    general: "realesr-general-x4v3",
+  }
 
-  // ModelsLab requires a public URL (not data URL), so upload to Vercel Blob first
   const imageUrl = await uploadToBlob(imageBase64)
+  const modelId = ESRGAN_MODELS[imageType] || ESRGAN_MODELS.general
 
   const response = await fetch("https://modelslab.com/api/v6/image_editing/super_resolution", {
     method: "POST",
@@ -45,7 +165,7 @@ async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, sc
     body: JSON.stringify({
       key: KEY,
       init_image: imageUrl,
-      scale: scale,
+      scale,
       model_id: modelId,
       face_enhance: faceEnhance,
       webhook: null,
@@ -57,11 +177,13 @@ async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, sc
 
   const data = await response.json()
 
+  if (data.status === "error") throw new Error(`ModelsLab: ${data.message}`)
+
   if (data.status === "processing" && data.fetch_result) {
     let result = data
     let attempts = 0
-    while (result.status === "processing" && attempts < 30) {
-      await new Promise((r) => setTimeout(r, 2000))
+    while (result.status === "processing" && attempts < 20) {
+      await new Promise((r) => setTimeout(r, 2500))
       const pollRes = await fetch(data.fetch_result, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -72,8 +194,9 @@ async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, sc
     }
     if (result.status === "success" && result.output?.[0]) {
       return res.status(200).json({
-        success: true, tier: "free",
-        engine: "Real-ESRGAN (ModelsLab Free)",
+        success: true,
+        tier: "free",
+        engine: "Real-ESRGAN (ModelsLab)",
         upscaledImageUrl: result.output[0],
       })
     }
@@ -82,8 +205,9 @@ async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, sc
 
   if (data.output?.[0]) {
     return res.status(200).json({
-      success: true, tier: "free",
-      engine: "Real-ESRGAN (ModelsLab Free)",
+      success: true,
+      tier: "free",
+      engine: "Real-ESRGAN (ModelsLab)",
       upscaledImageUrl: data.output[0],
     })
   }
@@ -91,41 +215,7 @@ async function upscaleWithModelsLab(res: VercelResponse, imageBase64: string, sc
   throw new Error("No output from ModelsLab")
 }
 
-async function upscaleWithImageRouter(res: VercelResponse, imageBase64: string) {
-  const KEY = process.env.IMAGEROUTER_API_KEY
-  if (!KEY) throw new Error("IMAGEROUTER_API_KEY not configured")
-
-  const response = await fetch("https://api.imagerouter.io/v1/openai/images/edits", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "stabilityai/stable-diffusion-xl-base-1.0",
-      prompt: "Enhance and upscale this image 2x. Improve sharpness, clarity, detail. Keep all content identical.",
-      image: `data:image/png;base64,${imageBase64}`,
-      size: "1024x1024",
-      quality: "high",
-      response_format: "url",
-    }),
-  })
-
-  if (!response.ok) throw new Error(`ImageRouter: ${response.status}`)
-
-  const data = await response.json()
-
-  if (data.data?.[0]?.url) {
-    return res.status(200).json({
-      success: true, tier: "free",
-      engine: "ImageRouter Free",
-      upscaledImageUrl: data.data[0].url,
-    })
-  }
-
-  throw new Error("No output from ImageRouter")
-}
-
+// ─── PRO ENGINE: OpenRouter vision models ────────────────────────────────────
 async function upscaleWithOpenRouter(
   res: VercelResponse,
   imageBase64: string,
@@ -139,10 +229,10 @@ async function upscaleWithOpenRouter(
   const model = PRO_MODEL_MAP[modelKey] || PRO_MODEL_MAP["nano-banana-2"]
 
   const prompts: Record<string, string> = {
-    general: `Upscale this image to ${scale}x resolution. Enhance details, reduce noise, sharpen. DO NOT change content. Output the enhanced image.`,
-    photo: `Professionally enhance this photograph at ${scale}x. Enhance skin, hair, fabric texture. Reduce noise/artifacts. Improve color accuracy. DO NOT change content.`,
-    illustration: `Upscale this illustration to ${scale}x. Preserve flat colors, clean edges, line art. Remove aliasing. DO NOT change content.`,
-    text: `Upscale this image to ${scale}x focusing on text clarity. Sharpen edges, enhance contrast. Remove blur around text. DO NOT change content.`,
+    general: `Upscale this image to ${scale}x resolution. Enhance details, reduce noise, sharpen edges. DO NOT change content or add new elements. Output ONLY the enhanced image.`,
+    photo: `Professionally upscale this photograph ${scale}x. Enhance skin tones, hair detail, fabric texture. Reduce noise and compression artifacts. DO NOT change content.`,
+    illustration: `Upscale this illustration ${scale}x. Preserve flat colors, clean vector-like edges, line art. Remove aliasing. DO NOT change content.`,
+    text: `Upscale this image ${scale}x focusing on text clarity. Sharpen character edges, enhance contrast. Remove blur. DO NOT change content.`,
   }
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -150,7 +240,7 @@ async function upscaleWithOpenRouter(
     headers: {
       Authorization: `Bearer ${KEY}`,
       "Content-Type": "application/json",
-      "HTTP-Referer": "https://your-plugin.com",
+      "HTTP-Referer": "https://framer.com",
       "X-Title": "AI Upscaler Plugin",
     },
     body: JSON.stringify({
@@ -190,7 +280,7 @@ async function upscaleWithOpenRouter(
     }
   }
 
-  if (!imageUrl && !imageB64) throw new Error("No image from OpenRouter")
+  if (!imageUrl && !imageB64) throw new Error("No image returned from OpenRouter")
 
   return res.status(200).json({
     success: true,
@@ -202,6 +292,7 @@ async function upscaleWithOpenRouter(
   })
 }
 
+// ─── MAIN HANDLER ─────────────────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin", "*")
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -209,13 +300,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === "OPTIONS") return res.status(200).end()
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" })
 
-  const { imageBase64, scaleFactor = 2, enhanceMode = "general", modelKey = "nano-banana-2", tier = "free", freeEngine = "real-esrgan", licenseKey = null, imageType = "general", faceEnhance = false } = req.body
+  const {
+    imageBase64,
+    scaleFactor = 2,
+    enhanceMode = "general",
+    modelKey = "nano-banana-2",
+    tier = "free",
+    licenseKey = null,
+    imageType = "general",
+    faceEnhance = false,
+  } = req.body
 
   if (!imageBase64) return res.status(400).json({ error: "No image provided" })
 
-  const userId = req.headers["x-user-id"] as string || "anonymous"
+  const userId = (req.headers["x-user-id"] as string) || "anonymous"
 
-  // Pro license validation
+  // ── Validate Pro license ─────────────────────────────────────────────────
   let validatedTier = "free"
   if (tier === "pro" && licenseKey) {
     try {
@@ -231,7 +331,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } catch (_) {}
   }
 
-  // PRO route
+  // ── PRO route ────────────────────────────────────────────────────────────
   if (validatedTier === "pro") {
     const host = req.headers.host || "localhost:3000"
     const protocol = host.includes("localhost") ? "http" : "https"
@@ -247,10 +347,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(402).json({ error: usageData.error || "All 100 tokens used. Purchase more to continue." })
     }
 
-    const cappedScale = Math.min(scaleFactor, 4)
-    await upscaleWithOpenRouter(res, imageBase64, cappedScale, enhanceMode, modelKey)
+    await upscaleWithOpenRouter(res, imageBase64, Math.min(scaleFactor, 4), enhanceMode, modelKey)
 
-    // Decrement token on success
     await fetch(`${protocol}://${host}/api/usage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -259,27 +357,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return
   }
 
-   // FREE route with fallback chain — Real-ESRGAN is primary (free 100/day)
-  const engineOrder: FreeEngine[] = ["real-esrgan", "imagerouter-free"]
-  const startIndex = engineOrder.indexOf(freeEngine as FreeEngine)
-  const orderedEngines = startIndex >= 0
-    ? [...engineOrder.slice(startIndex), ...engineOrder.slice(0, startIndex)]
-    : engineOrder
-
+  // ── FREE route: Replicate first, ModelsLab fallback ──────────────────────
   const errors: string[] = []
 
-  for (const engine of orderedEngines) {
-    try {
-      if (engine === "real-esrgan") {
-        const cappedScale = Math.min(scaleFactor, 2)
-        return await upscaleWithModelsLab(res, imageBase64, cappedScale, imageType, faceEnhance)
-      }
-      if (engine === "imagerouter-free") return await upscaleWithImageRouter(res, imageBase64)
-    } catch (err: any) {
-      errors.push(`${engine}: ${err.message}`)
-      continue
-    }
+  // Try Replicate first (primary free engine)
+  try {
+    return await upscaleWithReplicate(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
+  } catch (err: any) {
+    errors.push(`Replicate: ${err.message}`)
   }
 
-  return res.status(500).json({ error: `All free engines failed: ${errors.join("; ")}` })
+  // Fallback to ModelsLab
+  try {
+    return await upscaleWithModelsLab(res, imageBase64, Math.min(scaleFactor, 2), imageType, faceEnhance)
+  } catch (err: any) {
+    errors.push(`ModelsLab: ${err.message}`)
+  }
+
+  return res.status(500).json({ error: `All engines failed: ${errors.join("; ")}` })
 }
