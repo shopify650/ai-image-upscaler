@@ -326,7 +326,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ license_key: licenseKey }),
       })
-      const licData = await licRes.json()
+      const licData = await licRes.json() as any
       if (licData.valid && licData.tier === "pro") validatedTier = "pro"
     } catch (_) {}
   }
@@ -341,7 +341,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_id: userId, tier: "pro", license_key: licenseKey, action: "check" }),
     })
-    const usageData = await usageRes.json()
+    const usageData = await usageRes.json() as any
 
     if (!usageData.canUpscale) {
       return res.status(402).json({ error: usageData.error || "All 100 tokens used. Purchase more to continue." })

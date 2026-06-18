@@ -30,7 +30,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       body: formData.toString(),
     })
 
-    const data = await response.json()
+    const data = await response.json() as any
 
     if (!data.valid) {
       return res.status(200).json({ valid: false, tier: "free", error: data.error || "Invalid license key" })
